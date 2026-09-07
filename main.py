@@ -8,6 +8,7 @@ from PyQt6.QtCore import QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -41,6 +42,39 @@ def format_time(seconds: float | None) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+STT_QUALITY_OPTIONS = {
+    "빠름 (small)": "small",
+    "균형 (medium)": "medium",
+    "정확 (large-v3)": "large-v3",
+}
+
+LANGUAGE_OPTIONS = {
+    "한국어": "ko",
+    "자동 감지": None,
+    "영어": "en",
+    "중국어": "zh",
+    "일본어": "ja",
+}
+
+
+class ModelLoadWorker(QThread):
+    status = pyqtSignal(str)
+    completed = pyqtSignal(str, object)
+    failed = pyqtSignal(str, str)
+
+    def __init__(self, kind: str, engine, parent=None):
+        super().__init__(parent)
+        self.kind = kind
+        self.engine = engine
+
+    def run(self):
+        try:
+            self.engine.load_model(status_callback=self.status.emit)
+            self.completed.emit(self.kind, self.engine)
+        except Exception as exc:
+            self.failed.emit(self.kind, str(exc))
+
+
 class AnalysisWorker(QThread):
     status = pyqtSignal(str)
     progress = pyqtSignal(str, int, str)
@@ -48,11 +82,25 @@ class AnalysisWorker(QThread):
     cancelled = pyqtSignal()
     failed = pyqtSignal(str)
 
-    def __init__(self, audio_path: str, use_diarization: bool, hf_token: str, parent=None):
+    def __init__(
+        self,
+        audio_path: str,
+        use_diarization: bool,
+        hf_token: str,
+        model_size: str,
+        language: str | None,
+        stt_engine: LocalSTTEngine | None = None,
+        diarizer: LocalSpeakerDiarizer | None = None,
+        parent=None,
+    ):
         super().__init__(parent)
         self.audio_path = audio_path
         self.use_diarization = use_diarization
         self.hf_token = hf_token.strip()
+        self.model_size = model_size
+        self.language = language
+        self.stt_engine = stt_engine
+        self.diarizer = diarizer
         self._cancel_requested = False
 
     def cancel(self):
@@ -63,18 +111,24 @@ class AnalysisWorker(QThread):
 
     def run(self):
         try:
-            stt = LocalSTTEngine(
-                model_size="small",
-                device="cpu",
-                compute_type="int8",
-                language=None,
-            )
+            if (
+                self.stt_engine is None
+                or self.stt_engine.model_size != self.model_size
+            ):
+                self.stt_engine = LocalSTTEngine(
+                    model_size=self.model_size,
+                    device="cpu",
+                    compute_type="int8",
+                    language=self.language,
+                )
+            else:
+                self.stt_engine.language = self.language
 
             def stt_progress(percent: int, current: float, total: float):
                 detail = f"{format_time(current)} / {format_time(total)}"
                 self.progress.emit("STT", percent, detail)
 
-            segments = stt.transcribe(
+            segments = self.stt_engine.transcribe(
                 self.audio_path,
                 status_callback=self.status.emit,
                 progress_callback=stt_progress,
@@ -85,15 +139,16 @@ class AnalysisWorker(QThread):
                 if self._is_cancelled():
                     raise AnalysisCancelled()
 
-                diarizer = LocalSpeakerDiarizer(
-                    hf_token=self.hf_token or os.getenv("HF_TOKEN"),
-                    local_model_path=os.getenv("PYANNOTE_MODEL_PATH"),
-                )
+                if self.diarizer is None:
+                    self.diarizer = LocalSpeakerDiarizer(
+                        hf_token=self.hf_token or os.getenv("HF_TOKEN"),
+                        local_model_path=os.getenv("PYANNOTE_MODEL_PATH"),
+                    )
 
                 def diar_progress(step: str, percent: int):
                     self.progress.emit(f"화자분리 · {step}", percent, "")
 
-                turns = diarizer.diarize(
+                turns = self.diarizer.diarize(
                     self.audio_path,
                     status_callback=self.status.emit,
                     progress_callback=diar_progress,
@@ -232,6 +287,9 @@ class TranscriptionTab(QWidget):
         self.segments: list[TranscriptSegment] = []
         self.speaker_ids: list[str] = []
         self.worker: AnalysisWorker | None = None
+        self.model_loader: ModelLoadWorker | None = None
+        self.stt_engine: LocalSTTEngine | None = None
+        self.diarizer: LocalSpeakerDiarizer | None = None
 
         root = QVBoxLayout(self)
 
@@ -254,12 +312,42 @@ class TranscriptionTab(QWidget):
         self.file_edit.setPlaceholderText("음성 파일 또는 기존 TXT를 선택하세요.")
         root.addWidget(self.file_edit)
 
+        stt_row = QHBoxLayout()
+
+        stt_row.addWidget(QLabel("음성 언어"))
+        self.language_combo = QComboBox()
+        self.language_combo.addItems(LANGUAGE_OPTIONS.keys())
+        self.language_combo.setCurrentText("한국어")
+        stt_row.addWidget(self.language_combo)
+
+        stt_row.addWidget(QLabel("STT 품질"))
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(STT_QUALITY_OPTIONS.keys())
+        self.quality_combo.setCurrentText("빠름 (small)")
+        self.quality_combo.currentTextChanged.connect(self.on_stt_quality_changed)
+        stt_row.addWidget(self.quality_combo)
+
+        self.stt_model_status = QLabel("STT 모델: 준비 안 됨")
+        self.stt_load_button = QPushButton("STT 모델 불러오기")
+        self.stt_load_button.clicked.connect(self.preload_stt_model)
+        stt_row.addWidget(self.stt_model_status)
+        stt_row.addWidget(self.stt_load_button)
+        stt_row.addStretch(1)
+        root.addLayout(stt_row)
+
         option_row = QHBoxLayout()
         self.diarization_check = QCheckBox("화자 분리 사용")
         self.diarization_check.setChecked(True)
+        self.diarization_check.toggled.connect(self.update_diarization_controls)
+
         self.token_edit = QLineEdit()
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_edit.setPlaceholderText("HF Token - 최초 pyannote 모델 다운로드 시 필요할 수 있음")
+
+        self.diar_model_status = QLabel("화자 모델: 준비 안 됨")
+        self.diar_load_button = QPushButton("화자 모델 불러오기")
+        self.diar_load_button.clicked.connect(self.preload_diarization_model)
+
         self.analyze_button = QPushButton("분석 시작")
         self.analyze_button.clicked.connect(self.start_analysis)
         self.analyze_button.setEnabled(False)
@@ -271,13 +359,17 @@ class TranscriptionTab(QWidget):
         option_row.addWidget(self.diarization_check)
         option_row.addWidget(QLabel("HF Token"))
         option_row.addWidget(self.token_edit, 1)
+        option_row.addWidget(self.diar_model_status)
+        option_row.addWidget(self.diar_load_button)
         option_row.addWidget(self.analyze_button)
         option_row.addWidget(self.cancel_button)
         root.addLayout(option_row)
 
+        self.update_diarization_controls()
+
         privacy = QLabel(
-            "음성/STT 분석은 로컬에서 수행합니다. 모델이 PC에 없으면 최초 모델 다운로드에는 인터넷이 사용될 수 있습니다. "
-            "TXT 불러오기는 파일 내용을 외부로 전송하지 않습니다."
+            "음성/STT 분석은 로컬에서 수행합니다. 모델이 PC에 없으면 '모델 불러오기' 또는 첫 분석 시 "
+            "최초 모델 다운로드를 위해 인터넷이 사용될 수 있습니다. TXT 불러오기는 파일 내용을 외부로 전송하지 않습니다."
         )
         privacy.setWordWrap(True)
         privacy.setStyleSheet("color: #666;")
@@ -344,7 +436,6 @@ class TranscriptionTab(QWidget):
         self.status_label.setText("음성 분석 준비 완료.")
         self.mode_label.setText("입력: 음성 파일")
         self.analyze_button.setEnabled(True)
-        self._set_audio_options_enabled(True)
 
     def choose_txt(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -380,7 +471,6 @@ class TranscriptionTab(QWidget):
         self.populate_table()
 
         self.analyze_button.setEnabled(False)
-        self._set_audio_options_enabled(False)
         self.save_button.setEnabled(True)
 
         if imported.is_structured:
@@ -392,9 +482,139 @@ class TranscriptionTab(QWidget):
             self.status_label.setText(f"일반 TXT 불러오기 완료 · 텍스트 {len(self.segments)}줄")
             self.mode_label.setText("입력: 일반 TXT · 시간/화자 정보 없음")
 
-    def _set_audio_options_enabled(self, enabled: bool):
-        self.diarization_check.setEnabled(enabled)
-        self.token_edit.setEnabled(enabled)
+    def selected_model_size(self) -> str:
+        return STT_QUALITY_OPTIONS[self.quality_combo.currentText()]
+
+    def selected_language(self) -> str | None:
+        return LANGUAGE_OPTIONS[self.language_combo.currentText()]
+
+    def on_stt_quality_changed(self):
+        selected = self.selected_model_size()
+        if self.stt_engine is not None and self.stt_engine.model_size != selected:
+            self.stt_engine = None
+            self.stt_model_status.setText("STT 모델: 준비 안 됨")
+
+    def update_diarization_controls(self):
+        enabled = self.diarization_check.isChecked()
+        busy = self.worker is not None and self.worker.isRunning()
+        loading = self.model_loader is not None and self.model_loader.isRunning()
+        self.token_edit.setEnabled(enabled and not busy and not loading)
+        self.diar_load_button.setEnabled(enabled and not busy and not loading)
+
+    def _model_loader_busy(self) -> bool:
+        return self.model_loader is not None and self.model_loader.isRunning()
+
+    def preload_stt_model(self):
+        if self._model_loader_busy():
+            QMessageBox.information(self, "모델 로딩", "다른 모델을 불러오는 중입니다.")
+            return
+
+        model_size = self.selected_model_size()
+        if (
+            self.stt_engine is not None
+            and self.stt_engine.model_size == model_size
+            and self.stt_engine.is_loaded
+        ):
+            self.stt_model_status.setText(f"STT 모델: 준비됨 ({model_size})")
+            return
+
+        engine = LocalSTTEngine(
+            model_size=model_size,
+            device="cpu",
+            compute_type="int8",
+            language=self.selected_language(),
+        )
+        self.stt_model_status.setText(f"STT 모델: 불러오는 중 ({model_size})...")
+        self.stt_load_button.setEnabled(False)
+        self.quality_combo.setEnabled(False)
+
+        self.analyze_button.setEnabled(False)
+        self.model_loader = ModelLoadWorker("stt", engine, self)
+        self.model_loader.status.connect(self.status_label.setText)
+        self.model_loader.completed.connect(self.model_load_completed)
+        self.model_loader.failed.connect(self.model_load_failed)
+        self.model_loader.finished.connect(self.model_load_finished)
+        self.model_loader.start()
+
+    def preload_diarization_model(self):
+        if not self.diarization_check.isChecked():
+            return
+        if self._model_loader_busy():
+            QMessageBox.information(self, "모델 로딩", "다른 모델을 불러오는 중입니다.")
+            return
+        if self.diarizer is not None and self.diarizer.is_loaded:
+            self.diar_model_status.setText("화자 모델: 준비됨")
+            return
+
+        engine = LocalSpeakerDiarizer(
+            hf_token=self.token_edit.text().strip() or os.getenv("HF_TOKEN"),
+            local_model_path=os.getenv("PYANNOTE_MODEL_PATH"),
+        )
+        self.diar_model_status.setText("화자 모델: 불러오는 중...")
+        self.diar_load_button.setEnabled(False)
+        self.token_edit.setEnabled(False)
+
+        self.analyze_button.setEnabled(False)
+        self.model_loader = ModelLoadWorker("diarization", engine, self)
+        self.model_loader.status.connect(self.status_label.setText)
+        self.model_loader.completed.connect(self.model_load_completed)
+        self.model_loader.failed.connect(self.model_load_failed)
+        self.model_loader.finished.connect(self.model_load_finished)
+        self.model_loader.start()
+
+    def model_load_completed(self, kind: str, engine):
+        if kind == "stt":
+            self.stt_engine = engine
+            self.stt_model_status.setText(
+                f"STT 모델: 준비됨 ({self.stt_engine.model_size})"
+            )
+            self.stt_load_button.setEnabled(True)
+            self.quality_combo.setEnabled(True)
+            self.status_label.setText("STT 모델을 메모리에 불러왔습니다.")
+        else:
+            self.diarizer = engine
+            self.diar_model_status.setText("화자 모델: 준비됨")
+            self.status_label.setText("화자분리 모델을 메모리에 불러왔습니다.")
+
+        self.update_diarization_controls()
+
+    def model_load_failed(self, kind: str, message: str):
+        if kind == "stt":
+            self.stt_engine = None
+            self.stt_model_status.setText("STT 모델: 로딩 실패")
+            self.stt_load_button.setEnabled(True)
+            self.quality_combo.setEnabled(True)
+        else:
+            self.diarizer = None
+            self.diar_model_status.setText("화자 모델: 로딩 실패")
+
+        self.update_diarization_controls()
+        QMessageBox.critical(self, "모델 로딩 오류", message)
+
+    def model_load_finished(self):
+        # Keep the QThread object alive until Qt confirms run() has exited.
+        self.model_loader = None
+        self.stt_load_button.setEnabled(True)
+        self.quality_combo.setEnabled(True)
+        self.analyze_button.setEnabled(self.source_mode == "audio")
+        self.update_diarization_controls()
+
+    def _sync_model_status_from_worker(self):
+        if self.worker is None:
+            return
+
+        if self.worker.stt_engine is not None and self.worker.stt_engine.is_loaded:
+            self.stt_engine = self.worker.stt_engine
+            self.stt_model_status.setText(
+                f"STT 모델: 준비됨 ({self.stt_engine.model_size})"
+            )
+
+        if (
+            self.worker.diarizer is not None
+            and self.worker.diarizer.is_loaded
+        ):
+            self.diarizer = self.worker.diarizer
+            self.diar_model_status.setText("화자 모델: 준비됨")
 
     def start_analysis(self):
         if self.source_mode != "audio" or not self.audio_path:
@@ -411,14 +631,24 @@ class TranscriptionTab(QWidget):
         self.speaker_panel.set_speakers([])
 
         self.worker = AnalysisWorker(
-            self.audio_path,
-            self.diarization_check.isChecked(),
-            self.token_edit.text(),
-            self,
+            audio_path=self.audio_path,
+            use_diarization=self.diarization_check.isChecked(),
+            hf_token=self.token_edit.text(),
+            model_size=self.selected_model_size(),
+            language=self.selected_language(),
+            stt_engine=self.stt_engine,
+            diarizer=self.diarizer,
+            parent=self,
         )
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("분석 준비 중")
         self.cancel_button.setEnabled(True)
+        self.language_combo.setEnabled(False)
+        self.quality_combo.setEnabled(False)
+        self.stt_load_button.setEnabled(False)
+        self.diarization_check.setEnabled(False)
+        self.token_edit.setEnabled(False)
+        self.diar_load_button.setEnabled(False)
 
         self.worker.status.connect(self.status_label.setText)
         self.worker.progress.connect(self.update_progress)
@@ -444,12 +674,18 @@ class TranscriptionTab(QWidget):
             self.status_label.setText(f"{stage} 진행 중")
 
     def _restore_analysis_controls(self):
-        self.analyze_button.setEnabled(True)
+        self.analyze_button.setEnabled(self.source_mode == "audio")
         self.audio_button.setEnabled(True)
         self.txt_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
+        self.language_combo.setEnabled(True)
+        self.quality_combo.setEnabled(True)
+        self.stt_load_button.setEnabled(True)
+        self.diarization_check.setEnabled(True)
+        self.update_diarization_controls()
 
     def analysis_completed(self, segments):
+        self._sync_model_status_from_worker()
         self.segments = list(segments)
         self.speaker_ids = []
         for seg in self.segments:
@@ -468,12 +704,14 @@ class TranscriptionTab(QWidget):
         self.progress_bar.setFormat("분석 완료 · 100%")
 
     def analysis_cancelled(self):
+        self._sync_model_status_from_worker()
         self._restore_analysis_controls()
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("분석 중지됨")
         self.status_label.setText("분석이 중지되었습니다.")
 
     def analysis_failed(self, message: str):
+        self._sync_model_status_from_worker()
         self._restore_analysis_controls()
         self.progress_bar.setFormat("분석 실패")
         self.status_label.setText("분석 실패")
@@ -587,7 +825,7 @@ class FutureMinutesTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Meeting Transcriber v0.2")
+        self.setWindowTitle("Meeting Transcriber v0.4")
         self.resize(1120, 740)
 
         tabs = QTabWidget()

@@ -33,9 +33,20 @@ class LocalSTTEngine:
         self.language = language
         self._model = None
 
-    def _load_model(self):
+    @property
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    def load_model(
+        self,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ):
+        """Load the selected Whisper model into memory ahead of analysis."""
         if self._model is not None:
             return self._model
+
+        if status_callback:
+            status_callback(f"STT 모델 불러오는 중 ({self.model_size})...")
 
         try:
             from faster_whisper import WhisperModel
@@ -52,6 +63,9 @@ class LocalSTTEngine:
         )
         return self._model
 
+    def _load_model(self):
+        return self.load_model()
+
     def transcribe(
         self,
         audio_path: str | Path,
@@ -64,10 +78,7 @@ class LocalSTTEngine:
         if not audio_path.exists():
             raise FileNotFoundError(f"음성 파일을 찾을 수 없습니다: {audio_path}")
 
-        if status_callback:
-            status_callback(f"STT 모델 로딩 중 ({self.model_size})...")
-
-        model = self._load_model()
+        model = self.load_model(status_callback=status_callback)
 
         if cancel_check and cancel_check():
             raise AnalysisCancelled()

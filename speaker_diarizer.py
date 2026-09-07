@@ -26,9 +26,20 @@ class LocalSpeakerDiarizer:
         self.local_model_path = local_model_path or None
         self._pipeline = None
 
-    def _load_pipeline(self):
+    @property
+    def is_loaded(self) -> bool:
+        return self._pipeline is not None
+
+    def load_model(
+        self,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ):
+        """Load the diarization pipeline into memory ahead of analysis."""
         if self._pipeline is not None:
             return self._pipeline
+
+        if status_callback:
+            status_callback("화자분리 모델 불러오는 중...")
 
         try:
             from pyannote.audio import Pipeline
@@ -53,6 +64,9 @@ class LocalSpeakerDiarizer:
 
         return self._pipeline
 
+    def _load_pipeline(self):
+        return self.load_model()
+
     def diarize(
         self,
         audio_path: str | Path,
@@ -64,9 +78,7 @@ class LocalSpeakerDiarizer:
         if not audio_path.exists():
             raise FileNotFoundError(f"음성 파일을 찾을 수 없습니다: {audio_path}")
 
-        if status_callback:
-            status_callback("화자분리 모델 로딩 중...")
-        pipeline = self._load_pipeline()
+        pipeline = self.load_model(status_callback=status_callback)
 
         if cancel_check and cancel_check():
             raise AnalysisCancelled()
