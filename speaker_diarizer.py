@@ -3,10 +3,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
-
+import os
 from stt_engine import AnalysisCancelled, TranscriptSegment
 
+_FFMPEG_DLL_HANDLE = None
 
+
+def prepare_ffmpeg():
+    global _FFMPEG_DLL_HANDLE
+
+    ffmpeg_bin = r"C:\Tools\ffmpeg\bin"
+
+    if _FFMPEG_DLL_HANDLE is None:
+        _FFMPEG_DLL_HANDLE = os.add_dll_directory(ffmpeg_bin)
+
+    os.environ["PATH"] = ffmpeg_bin + os.pathsep + os.environ.get("PATH", "")
 @dataclass
 class SpeakerTurn:
     start: float
@@ -44,6 +55,7 @@ class LocalSpeakerDiarizer:
             status_callback("화자분리 모델 불러오는 중...")
 
         try:
+            prepare_ffmpeg()
             from pyannote.audio import Pipeline
         except ImportError as exc:
             raise RuntimeError(
@@ -142,6 +154,73 @@ class LocalSpeakerDiarizer:
             raise RuntimeError("화자분리 결과가 비어 있습니다.")
         return turns
 
+
+
+def prepare_transcript_for_diarization(
+    transcript: list[TranscriptSegment],
+    audio_duration: float,
+    tolerance_seconds: float = 1.0,
+) -> list[TranscriptSegment]:
+    """Validate transcript timestamps against audio and fill missing end times.
+
+    Speaker diarization is intentionally independent from STT, but speaker labels
+    can only be mapped when transcript segments have a real timeline that belongs
+    to the selected audio file.
+    """
+    if not transcript:
+        raise RuntimeError("화자 라벨링할 텍스트가 없습니다.")
+    if audio_duration <= 0:
+        raise RuntimeError("음성 파일 길이를 확인할 수 없습니다.")
+
+    normalized = [
+        TranscriptSegment(
+            start=seg.start,
+            end=seg.end,
+            text=seg.text,
+            speaker_id=seg.speaker_id,
+        )
+        for seg in transcript
+    ]
+
+    for index, segment in enumerate(normalized):
+        if segment.start is None:
+            raise RuntimeError(
+                "화자 라벨링에는 각 발언의 시작 시간이 필요합니다. "
+                "일반 TXT가 아니라 [00:00] 형식의 타임라인 TXT를 사용하거나 STT를 먼저 실행하세요."
+            )
+        if segment.start < 0:
+            raise RuntimeError(f"{index + 1}번째 발언의 시작 시간이 0초보다 작습니다.")
+        if index and normalized[index - 1].start is not None:
+            if segment.start < normalized[index - 1].start:
+                raise RuntimeError("텍스트 타임라인이 시간 순서대로 정렬되어 있지 않습니다.")
+
+        if segment.end is None:
+            next_start = (
+                normalized[index + 1].start
+                if index + 1 < len(normalized)
+                else audio_duration
+            )
+            segment.end = float(next_start) if next_start is not None else audio_duration
+
+        if segment.end < segment.start:
+            raise RuntimeError(f"{index + 1}번째 발언의 종료 시간이 시작 시간보다 빠릅니다.")
+
+        # A tiny codec/container rounding difference is tolerated, but a real
+        # transcript overrun (e.g. 7 min timeline for a 5 min file) is blocked.
+        if segment.start > audio_duration + tolerance_seconds:
+            raise RuntimeError(
+                f"텍스트 타임라인이 음성 길이를 초과합니다. "
+                f"{index + 1}번째 발언 시작 {segment.start:.1f}초 / 음성 길이 {audio_duration:.1f}초"
+            )
+        if segment.end > audio_duration + tolerance_seconds:
+            raise RuntimeError(
+                f"텍스트 타임라인이 음성 길이를 초과합니다. "
+                f"{index + 1}번째 발언 종료 {segment.end:.1f}초 / 음성 길이 {audio_duration:.1f}초"
+            )
+        if segment.end > audio_duration:
+            segment.end = audio_duration
+
+    return normalized
 
 def assign_speakers(
     transcript: list[TranscriptSegment],

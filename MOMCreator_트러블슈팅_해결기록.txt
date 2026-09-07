@@ -1,0 +1,356 @@
+﻿MOMCreator 트러블슈팅 / 해결 기록
+작성 목적: 프로젝트 진행 중 실제로 효과가 있었던 해결법과 실패했던 방법을 구분해 재사용하기 위함.
+
+============================================================
+1. PyQt6 QtCore WinError 127
+============================================================
+[상태] 해결 확인
+
+증상
+- from PyQt6 import QtCore 실행 시:
+  ImportError: DLL load failed while importing QtCore:
+  지정된 프로시저를 찾을 수 없습니다.
+- Qt6Core.dll 파일 자체는 존재했음.
+- 절대경로로 Qt6Core.dll을 직접 로드해도 WinError 127 발생.
+
+원인 추정
+- conda-forge를 통해 FFmpeg를 설치한 뒤 Conda 환경의 공용 DLL/runtime 조합이 변경되면서
+  PyQt6/Qt6가 잘못된 DLL 조합을 사용하게 된 것으로 판단.
+
+해결
+1) Conda revision 확인
+   conda list --revisions
+
+2) 문제 발생 전 정상 revision으로 복원
+   conda install --revision <정상 revision 번호>
+
+확인 명령
+python -c "from PyQt6 import QtCore; print('PyQt OK', QtCore.PYQT_VERSION_STR, QtCore.QT_VERSION_STR)"
+
+주의
+- MOMCreator 환경 안에서 conda-forge FFmpeg 설치를 다시 시도하지 않음.
+
+
+============================================================
+2. Conda FFmpeg 설치로 인한 DLL 충돌
+============================================================
+[상태] 원인으로 판단 / 해당 방식 사용 금지
+
+문제가 된 방법
+conda install -c conda-forge ffmpeg
+
+결과
+- FFmpeg 설치 이후 기존에 정상 동작하던 PyQt6 QtCore 로딩에서 WinError 127 발생.
+- PyQt6 재설치 및 PATH 우선순위 변경만으로는 해결되지 않았음.
+
+정리
+- MOMCreator Conda 환경 내부에 FFmpeg를 직접 설치하는 방식은 사용하지 않음.
+
+
+============================================================
+3. FFmpeg / TorchCodec DLL 문제
+============================================================
+[상태] 해결 확인
+
+증상
+- STT 완료 후 화자 탐지 단계에서 TorchCodec 관련 DLL 오류 발생.
+- libtorchcodec_core*.dll 또는 해당 DLL의 dependency를 불러오지 못함.
+
+해결
+- FFmpeg를 Conda 환경에 설치하지 않고 별도 폴더에 독립 설치.
+- shared DLL이 포함된 FFmpeg 빌드를 사용.
+- FFmpeg DLL 경로를 Windows 전역 PATH에 영구 등록하지 않음.
+- 화자분리 코드에서 필요한 시점에만 FFmpeg bin 폴더를 제한적으로 DLL 검색 경로에 추가.
+
+권장 설치 위치 예시
+C:\Tools\ffmpeg\bin
+
+speaker_diarizer.py 적용 예시
+------------------------------------------------------------
+import os
+
+_FFMPEG_DLL_HANDLE = None
+
+def prepare_ffmpeg():
+    global _FFMPEG_DLL_HANDLE
+
+    ffmpeg_bin = r"C:\Tools\ffmpeg\bin"
+
+    if _FFMPEG_DLL_HANDLE is None:
+        _FFMPEG_DLL_HANDLE = os.add_dll_directory(ffmpeg_bin)
+
+    os.environ["PATH"] = ffmpeg_bin + os.pathsep + os.environ.get("PATH", "")
+------------------------------------------------------------
+
+pyannote 로딩 직전
+------------------------------------------------------------
+prepare_ffmpeg()
+from pyannote.audio import Pipeline
+------------------------------------------------------------
+
+핵심
+- PyQt6가 먼저 정상 로딩된 뒤,
+  화자분리 단계에서만 FFmpeg DLL 경로를 추가하도록 제한함.
+- 이 방식으로 FFmpeg DLL 문제 해결 확인.
+
+
+============================================================
+4. Hugging Face 인증 경고 / 모델 접근 문제
+============================================================
+[상태] 해결 확인
+
+증상
+- HF Hub unauthenticated request 경고.
+- 모델 접근/다운로드 과정에서 인증 필요.
+
+해결
+- Hugging Face Access Token 발급 후 사용.
+- HF_TOKEN 또는 프로그램 내 토큰 입력란을 통해 인증.
+
+정리
+- Hugging Face 관련 인증 문제는 토큰 등록으로 해결.
+
+
+============================================================
+5. cuBLAS / CUDA DLL 검색 문제
+============================================================
+[상태] 보류 / 해결 과정이 명확하지 않음
+
+증상
+- cublas64_12.dll을 Python이 찾지 못함.
+- 실제 DLL 파일은 site-packages\nvidia\cublas\bin 등에 존재했던 경우가 있었음.
+
+적용했던 것으로 기억되는 조치
+- CUDA 재설치.
+- CUDA 관련 PATH 정리/지정.
+- nvidia\cublas\bin 위치 확인 및 DLL 검색 경로 점검.
+
+확인에 사용한 명령
+nvidia-smi
+nvcc --version
+where cublas64_12.dll
+where /r C:\Users\hokusho\miniforge3\envs\MOMCreator cublas64_12.dll
+
+Python 직접 로딩 확인
+python -c "import ctypes; ctypes.CDLL('cublas64_12.dll'); print('cuBLAS OK')"
+
+주의
+- 최종적으로 어떤 한 가지 조치가 결정적으로 해결했는지는 명확하지 않음.
+- 향후 동일 문제 발생 시 CUDA 재설치 + PATH + 실제 DLL 위치를 함께 확인.
+
+
+============================================================
+6. faster-whisper GPU 사용
+============================================================
+[상태] 코드 적용
+
+적용 내용
+- GPU 사용 가능 시 CUDA 사용.
+- GPU 사용 실패 시 CPU/int8로 자동 fallback.
+
+구조
+GPU 가능
+  -> faster-whisper / CTranslate2 CUDA 사용
+
+GPU 로딩 실패
+  -> CPU
+  -> compute_type = int8
+
+주의
+- nvidia-smi에서 GPU가 보여도 CTranslate2가 필요한 CUDA/cuBLAS/cuDNN 런타임이
+  정상이라는 뜻은 아님.
+
+
+============================================================
+7. pyannote 화자분리 GPU 사용
+============================================================
+[상태] 코드 적용
+
+적용 내용
+- 화자분리 pipeline을 CUDA 장치로 이동 시도.
+- 실패하면 CPU로 fallback.
+
+예시
+------------------------------------------------------------
+import torch
+pipeline.to(torch.device("cuda"))
+------------------------------------------------------------
+
+주의
+- faster-whisper GPU와 pyannote GPU는 서로 다른 경로를 사용.
+  faster-whisper : CTranslate2
+  pyannote       : PyTorch
+
+
+============================================================
+8. STT와 화자 라벨링 구조 분리
+============================================================
+[상태] 적용
+
+기존 구조
+음성
+ -> STT
+ -> 화자분리
+ -> 결과
+
+문제
+- 화자분리에서 오류가 나면 STT 작업 전체가 실패한 것처럼 보임.
+- 이미 완료된 텍스트 추출을 다시 해야 하는 비효율 발생.
+
+변경 구조
+1) STT
+   음성 -> 타임라인 포함 텍스트
+
+2) 화자 라벨링
+   음성 + 타임라인 포함 텍스트 -> 화자 라벨 추가
+
+효과
+- STT와 화자분리를 각각 독립 실행 가능.
+- 화자분리 실패 시 기존 STT 결과 유지.
+- 이미 존재하는 구조화 TXT에도 원본 음성만 있으면 화자 라벨링 가능.
+
+
+============================================================
+9. 기존 TXT + 음성으로 화자 라벨링
+============================================================
+[상태] 적용
+
+조건
+- 원본 음성 파일 존재.
+- TXT에 각 텍스트 구간의 timestamp가 존재.
+
+가능
+- STT를 다시 실행하지 않고 화자 라벨링만 수행.
+
+불가능
+- 시간 정보가 전혀 없는 일반 TXT.
+
+
+============================================================
+10. 음성 길이와 TXT 타임라인 검증
+============================================================
+[상태] 적용
+
+목적
+- 잘못된 음성과 잘못된 TXT가 조합되는 것을 방지.
+
+예시
+- 음성 길이: 5분
+- TXT 마지막 타임라인: 7분
+-> 화자 라벨링 시작 전 오류 처리.
+
+추가 처리
+- 마지막 segment의 종료시간이 명시되어 있지 않은 경우
+  음성 전체 길이를 마지막 종료시점으로 활용.
+
+
+============================================================
+11. 화자분리 실패 시 STT 결과 보존
+============================================================
+[상태] 적용
+
+적용 내용
+- 화자분리 오류가 발생해도 기존 STT 결과 또는 불러온 TXT 결과를 삭제하지 않음.
+- 화자 라벨링만 재시도 가능.
+
+
+============================================================
+12. STT / 화자 모델 사전 로딩 및 재사용
+============================================================
+[상태] 코드 적용
+
+목적
+- 매 분석마다 모델을 처음부터 다시 불러오는 시간 감소.
+
+적용 내용
+- STT 모델 사전 로딩.
+- 화자분리 모델 사전 로딩.
+- 같은 설정이면 메모리의 모델 재사용.
+- GPU/CPU 또는 STT 품질 설정이 변경된 경우 기존 모델 무효화 후 재로드.
+
+
+============================================================
+13. PyQt6 재설치
+============================================================
+[상태] 이번 DLL 문제에는 효과 없음
+
+시도
+- PyQt6
+- PyQt6-Qt6
+- PyQt6-sip
+제거 후 재설치.
+
+결과
+- QtCore WinError 127 해결되지 않음.
+
+정리
+- QtCore.dll 또는 dependency 충돌 문제에서는 단순 PyQt6 재설치만 반복하지 않음.
+
+
+============================================================
+14. Qt DLL 폴더 PATH 우선순위 변경
+============================================================
+[상태] 이번 DLL 문제에는 효과 없음
+
+시도
+- PyQt6\Qt6\bin을 PATH 앞쪽에 추가.
+
+결과
+- WinError 127 계속 발생.
+
+정리
+- 단순 DLL 검색 순서 문제가 아니라 Conda runtime/DLL 세트 자체가 꼬인 경우에는 해결책이 아님.
+
+
+============================================================
+15. DLL 문제 발생 시 기본 점검 명령
+============================================================
+
+현재 Python 환경 확인
+python -c "import sys; print(sys.executable)"
+
+PyQt6 확인
+python -c "from PyQt6 import QtCore; print('PyQt OK', QtCore.PYQT_VERSION_STR, QtCore.QT_VERSION_STR)"
+
+CUDA / GPU 확인
+nvidia-smi
+nvcc --version
+
+cuBLAS 확인
+where cublas64_12.dll
+where /r "%CONDA_PREFIX%" cublas64_12.dll
+
+cuBLAS 직접 로딩
+python -c "import ctypes; ctypes.CDLL('cublas64_12.dll'); print('cuBLAS OK')"
+
+PyTorch CUDA 확인
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.version.cuda)"
+
+관련 패키지 확인
+python -m pip show torch torchcodec pyannote.audio
+python -m pip list | findstr /i "nvidia cublas cudnn PyQt"
+
+Conda 변경 이력
+conda list --revisions
+
+
+============================================================
+16. 현재 기준 주의사항 요약
+============================================================
+
+1) MOMCreator 환경에서 아래 명령은 피함.
+   conda install -c conda-forge ffmpeg
+
+2) FFmpeg는 Conda 바깥에 독립 설치.
+
+3) FFmpeg bin 폴더를 Windows 전역 PATH에 영구 등록하지 않음.
+
+4) FFmpeg DLL은 화자분리 단계에서만 제한적으로 추가.
+
+5) PyQt6 QtCore가 갑자기 WinError 127을 내면,
+   무작정 PyQt6 재설치보다 Conda revision 변경 여부부터 확인.
+
+6) CUDA/cuBLAS 문제는
+   GPU 드라이버 / CUDA Toolkit / pip NVIDIA DLL / PATH를 서로 별개로 점검.
+
+7) STT와 화자 라벨링은 독립 단계로 유지.
