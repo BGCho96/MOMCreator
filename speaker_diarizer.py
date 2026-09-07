@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from stt_engine import TranscriptSegment
+from stt_engine import AnalysisCancelled, TranscriptSegment
 
 
 @dataclass
@@ -57,6 +57,8 @@ class LocalSpeakerDiarizer:
         self,
         audio_path: str | Path,
         status_callback: Optional[Callable[[str], None]] = None,
+        progress_callback: Optional[Callable[[str, int], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ) -> list[SpeakerTurn]:
         audio_path = Path(audio_path)
         if not audio_path.exists():
@@ -66,9 +68,32 @@ class LocalSpeakerDiarizer:
             status_callback("화자분리 모델 로딩 중...")
         pipeline = self._load_pipeline()
 
+        if cancel_check and cancel_check():
+            raise AnalysisCancelled()
+
         if status_callback:
             status_callback("화자 구간 분석 중...")
-        output = pipeline(str(audio_path))
+
+        def hook(step_name, _artifact=None, **kwargs):
+            if cancel_check and cancel_check():
+                raise AnalysisCancelled()
+
+            if progress_callback:
+                completed = kwargs.get("completed")
+                total = kwargs.get("total")
+                if completed is not None and total:
+                    percent = int(max(0, min(100, completed / total * 100)))
+                else:
+                    percent = 0
+                progress_callback(str(step_name), percent)
+
+        output = pipeline(str(audio_path), hook=hook)
+
+        if cancel_check and cancel_check():
+            raise AnalysisCancelled()
+
+        if progress_callback:
+            progress_callback("화자분리 완료", 100)
 
         annotation = getattr(output, "exclusive_speaker_diarization", None)
         if annotation is None:
@@ -102,6 +127,9 @@ def assign_speakers(
         return transcript
 
     for segment in transcript:
+        if segment.start is None or segment.end is None:
+            continue
+
         best_speaker = ""
         best_overlap = 0.0
 
