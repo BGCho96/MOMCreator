@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from device_utils import ProcessingDevice, resolve_processing_device
 from speaker_diarizer import LocalSpeakerDiarizer, assign_speakers
 from stt_engine import AnalysisCancelled, LocalSTTEngine, TranscriptSegment
 from text_importer import ImportedTranscript, load_transcript_txt
@@ -89,6 +90,8 @@ class AnalysisWorker(QThread):
         hf_token: str,
         model_size: str,
         language: str | None,
+        device: str,
+        compute_type: str,
         stt_engine: LocalSTTEngine | None = None,
         diarizer: LocalSpeakerDiarizer | None = None,
         parent=None,
@@ -99,6 +102,8 @@ class AnalysisWorker(QThread):
         self.hf_token = hf_token.strip()
         self.model_size = model_size
         self.language = language
+        self.device = device
+        self.compute_type = compute_type
         self.stt_engine = stt_engine
         self.diarizer = diarizer
         self._cancel_requested = False
@@ -114,11 +119,13 @@ class AnalysisWorker(QThread):
             if (
                 self.stt_engine is None
                 or self.stt_engine.model_size != self.model_size
+                or self.stt_engine.device != self.device
+                or self.stt_engine.compute_type != self.compute_type
             ):
                 self.stt_engine = LocalSTTEngine(
                     model_size=self.model_size,
-                    device="cpu",
-                    compute_type="int8",
+                    device=self.device,
+                    compute_type=self.compute_type,
                     language=self.language,
                 )
             else:
@@ -139,10 +146,11 @@ class AnalysisWorker(QThread):
                 if self._is_cancelled():
                     raise AnalysisCancelled()
 
-                if self.diarizer is None:
+                if self.diarizer is None or self.diarizer.device != self.device:
                     self.diarizer = LocalSpeakerDiarizer(
                         hf_token=self.hf_token or os.getenv("HF_TOKEN"),
                         local_model_path=os.getenv("PYANNOTE_MODEL_PATH"),
+                        device=self.device,
                     )
 
                 def diar_progress(step: str, percent: int):
@@ -290,6 +298,7 @@ class TranscriptionTab(QWidget):
         self.model_loader: ModelLoadWorker | None = None
         self.stt_engine: LocalSTTEngine | None = None
         self.diarizer: LocalSpeakerDiarizer | None = None
+        self.processing_device: ProcessingDevice = resolve_processing_device(True)
 
         root = QVBoxLayout(self)
 
@@ -334,6 +343,26 @@ class TranscriptionTab(QWidget):
         stt_row.addWidget(self.stt_load_button)
         stt_row.addStretch(1)
         root.addLayout(stt_row)
+
+        performance_title = QLabel("성능 설정")
+        performance_title.setStyleSheet("font-weight: 600; margin-top: 10px;")
+        root.addWidget(performance_title)
+
+        performance_row = QHBoxLayout()
+        self.gpu_auto_check = QCheckBox("GPU 사용 가능하면 자동으로 사용")
+        self.gpu_auto_check.setChecked(True)
+        self.gpu_auto_check.toggled.connect(self.on_processing_device_changed)
+
+        self.device_status = QLabel("")
+        self.device_status.setStyleSheet("color: #555;")
+
+        performance_row.addWidget(self.gpu_auto_check)
+        performance_row.addSpacing(16)
+        performance_row.addWidget(self.device_status)
+        performance_row.addStretch(1)
+        root.addLayout(performance_row)
+
+        self.refresh_processing_device()
 
         option_row = QHBoxLayout()
         self.diarization_check = QCheckBox("화자 분리 사용")
@@ -482,6 +511,44 @@ class TranscriptionTab(QWidget):
             self.status_label.setText(f"일반 TXT 불러오기 완료 · 텍스트 {len(self.segments)}줄")
             self.mode_label.setText("입력: 일반 TXT · 시간/화자 정보 없음")
 
+    def refresh_processing_device(self):
+        self.processing_device = resolve_processing_device(
+            self.gpu_auto_check.isChecked()
+        )
+
+        if self.processing_device.device == "cuda":
+            self.device_status.setText(
+                f"처리 장치: {self.processing_device.display_name} · GPU 사용"
+            )
+        elif self.processing_device.gpu_available:
+            self.device_status.setText(
+                "처리 장치: CPU · GPU 자동 사용 꺼짐"
+            )
+        else:
+            self.device_status.setText(
+                "처리 장치: CPU · NVIDIA GPU 감지 안 됨"
+            )
+
+    def on_processing_device_changed(self):
+        previous_device = (
+            self.processing_device.device,
+            self.processing_device.compute_type,
+        )
+        self.refresh_processing_device()
+        current_device = (
+            self.processing_device.device,
+            self.processing_device.compute_type,
+        )
+
+        # A loaded model belongs to the device it was created on.
+        # Changing the performance setting invalidates cached models only
+        # when the actual processing configuration changes.
+        if previous_device != current_device:
+            self.stt_engine = None
+            self.diarizer = None
+            self.stt_model_status.setText("STT 모델: 준비 안 됨")
+            self.diar_model_status.setText("화자 모델: 준비 안 됨")
+
     def selected_model_size(self) -> str:
         return STT_QUALITY_OPTIONS[self.quality_combo.currentText()]
 
@@ -518,10 +585,11 @@ class TranscriptionTab(QWidget):
             self.stt_model_status.setText(f"STT 모델: 준비됨 ({model_size})")
             return
 
+        self.refresh_processing_device()
         engine = LocalSTTEngine(
             model_size=model_size,
-            device="cpu",
-            compute_type="int8",
+            device=self.processing_device.device,
+            compute_type=self.processing_device.compute_type,
             language=self.selected_language(),
         )
         self.stt_model_status.setText(f"STT 모델: 불러오는 중 ({model_size})...")
@@ -529,6 +597,7 @@ class TranscriptionTab(QWidget):
         self.quality_combo.setEnabled(False)
 
         self.analyze_button.setEnabled(False)
+        self.gpu_auto_check.setEnabled(False)
         self.model_loader = ModelLoadWorker("stt", engine, self)
         self.model_loader.status.connect(self.status_label.setText)
         self.model_loader.completed.connect(self.model_load_completed)
@@ -546,15 +615,18 @@ class TranscriptionTab(QWidget):
             self.diar_model_status.setText("화자 모델: 준비됨")
             return
 
+        self.refresh_processing_device()
         engine = LocalSpeakerDiarizer(
             hf_token=self.token_edit.text().strip() or os.getenv("HF_TOKEN"),
             local_model_path=os.getenv("PYANNOTE_MODEL_PATH"),
+            device=self.processing_device.device,
         )
         self.diar_model_status.setText("화자 모델: 불러오는 중...")
         self.diar_load_button.setEnabled(False)
         self.token_edit.setEnabled(False)
 
         self.analyze_button.setEnabled(False)
+        self.gpu_auto_check.setEnabled(False)
         self.model_loader = ModelLoadWorker("diarization", engine, self)
         self.model_loader.status.connect(self.status_label.setText)
         self.model_loader.completed.connect(self.model_load_completed)
@@ -565,15 +637,19 @@ class TranscriptionTab(QWidget):
     def model_load_completed(self, kind: str, engine):
         if kind == "stt":
             self.stt_engine = engine
+            actual_device = "GPU" if self.stt_engine.device == "cuda" else "CPU"
             self.stt_model_status.setText(
-                f"STT 모델: 준비됨 ({self.stt_engine.model_size})"
+                f"STT 모델: 준비됨 ({self.stt_engine.model_size} · {actual_device})"
             )
             self.stt_load_button.setEnabled(True)
             self.quality_combo.setEnabled(True)
             self.status_label.setText("STT 모델을 메모리에 불러왔습니다.")
         else:
             self.diarizer = engine
-            self.diar_model_status.setText("화자 모델: 준비됨")
+            actual_device = "GPU" if self.diarizer.device == "cuda" else "CPU"
+            self.diar_model_status.setText(
+                f"화자 모델: 준비됨 ({actual_device})"
+            )
             self.status_label.setText("화자분리 모델을 메모리에 불러왔습니다.")
 
         self.update_diarization_controls()
@@ -597,6 +673,8 @@ class TranscriptionTab(QWidget):
         self.stt_load_button.setEnabled(True)
         self.quality_combo.setEnabled(True)
         self.analyze_button.setEnabled(self.source_mode == "audio")
+        self.gpu_auto_check.setEnabled(True)
+        self.refresh_processing_device()
         self.update_diarization_controls()
 
     def _sync_model_status_from_worker(self):
@@ -605,8 +683,9 @@ class TranscriptionTab(QWidget):
 
         if self.worker.stt_engine is not None and self.worker.stt_engine.is_loaded:
             self.stt_engine = self.worker.stt_engine
+            actual_device = "GPU" if self.stt_engine.device == "cuda" else "CPU"
             self.stt_model_status.setText(
-                f"STT 모델: 준비됨 ({self.stt_engine.model_size})"
+                f"STT 모델: 준비됨 ({self.stt_engine.model_size} · {actual_device})"
             )
 
         if (
@@ -614,7 +693,10 @@ class TranscriptionTab(QWidget):
             and self.worker.diarizer.is_loaded
         ):
             self.diarizer = self.worker.diarizer
-            self.diar_model_status.setText("화자 모델: 준비됨")
+            actual_device = "GPU" if self.diarizer.device == "cuda" else "CPU"
+            self.diar_model_status.setText(
+                f"화자 모델: 준비됨 ({actual_device})"
+            )
 
     def start_analysis(self):
         if self.source_mode != "audio" or not self.audio_path:
@@ -630,12 +712,15 @@ class TranscriptionTab(QWidget):
         self.speaker_ids = []
         self.speaker_panel.set_speakers([])
 
+        self.refresh_processing_device()
         self.worker = AnalysisWorker(
             audio_path=self.audio_path,
             use_diarization=self.diarization_check.isChecked(),
             hf_token=self.token_edit.text(),
             model_size=self.selected_model_size(),
             language=self.selected_language(),
+            device=self.processing_device.device,
+            compute_type=self.processing_device.compute_type,
             stt_engine=self.stt_engine,
             diarizer=self.diarizer,
             parent=self,
@@ -649,6 +734,7 @@ class TranscriptionTab(QWidget):
         self.diarization_check.setEnabled(False)
         self.token_edit.setEnabled(False)
         self.diar_load_button.setEnabled(False)
+        self.gpu_auto_check.setEnabled(False)
 
         self.worker.status.connect(self.status_label.setText)
         self.worker.progress.connect(self.update_progress)
@@ -682,6 +768,8 @@ class TranscriptionTab(QWidget):
         self.quality_combo.setEnabled(True)
         self.stt_load_button.setEnabled(True)
         self.diarization_check.setEnabled(True)
+        self.gpu_auto_check.setEnabled(True)
+        self.refresh_processing_device()
         self.update_diarization_controls()
 
     def analysis_completed(self, segments):
@@ -825,7 +913,7 @@ class FutureMinutesTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Meeting Transcriber v0.4")
+        self.setWindowTitle("Meeting Transcriber v0.5")
         self.resize(1120, 740)
 
         tabs = QTabWidget()

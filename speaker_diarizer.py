@@ -21,9 +21,11 @@ class LocalSpeakerDiarizer:
         self,
         hf_token: Optional[str] = None,
         local_model_path: Optional[str] = None,
+        device: str = "cpu",
     ):
         self.hf_token = hf_token or None
         self.local_model_path = local_model_path or None
+        self.device = device
         self._pipeline = None
 
     @property
@@ -61,6 +63,17 @@ class LocalSpeakerDiarizer:
                 "화자분리 모델 로딩 실패: "
                 f"{exc}\n처음 모델을 받는 경우 Hugging Face 모델 사용 조건 동의와 토큰이 필요할 수 있습니다."
             ) from exc
+
+        if self.device == "cuda":
+            try:
+                import torch
+                self._pipeline.to(torch.device("cuda"))
+            except Exception:
+                if status_callback:
+                    status_callback(
+                        "화자 모델 GPU 전환에 실패하여 CPU 모드로 사용합니다..."
+                    )
+                self.device = "cpu"
 
         return self._pipeline
 

@@ -56,11 +56,35 @@ class LocalSTTEngine:
                 "pip install faster-whisper"
             ) from exc
 
-        self._model = WhisperModel(
-            self.model_size,
-            device=self.device,
-            compute_type=self.compute_type,
-        )
+        try:
+            self._model = WhisperModel(
+                self.model_size,
+                device=self.device,
+                compute_type=self.compute_type,
+            )
+        except Exception as exc:
+            # Hardware may be visible through nvidia-smi while the CUDA/cuDNN
+            # runtime required by CTranslate2 is not usable. In automatic GPU
+            # mode, fall back to the existing CPU-safe configuration.
+            if self.device != "cuda":
+                raise
+
+            if status_callback:
+                status_callback(
+                    "GPU STT 모델 로딩에 실패하여 CPU 모드로 전환합니다..."
+                )
+
+            self.device = "cpu"
+            self.compute_type = "int8"
+            try:
+                self._model = WhisperModel(
+                    self.model_size,
+                    device=self.device,
+                    compute_type=self.compute_type,
+                )
+            except Exception:
+                raise exc
+
         return self._model
 
     def _load_model(self):

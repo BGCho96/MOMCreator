@@ -140,3 +140,41 @@ pyannote `speaker-diarization-community-1`은 최초 접근 시 Hugging Face 사
 
 STT 품질을 변경하면 기존에 로딩된 STT 모델은 해제된 것으로 처리하고,
 새 품질의 모델을 다시 불러와야 합니다.
+
+
+## v0.5 추가 기능 - 성능 설정
+
+STT 설정과 별도로 `성능 설정` 영역을 추가했습니다.
+
+### GPU 자동 사용
+기본값:
+
+```text
+☑ GPU 사용 가능하면 자동으로 사용
+```
+
+- NVIDIA GPU가 Windows에서 감지되면 STT는 `cuda + float16`을 우선 사용합니다.
+- GPU를 감지하지 못하거나 체크를 끄면 `cpu + int8`을 사용합니다.
+- 실제 CUDA/CTranslate2 환경 문제로 STT GPU 모델 로딩이 실패하면 CPU 모드로 자동 fallback 합니다.
+- pyannote 화자분리도 GPU 사용을 시도하고, GPU 전환이 불가능하면 CPU로 유지합니다.
+
+### 처리 장치 상태
+UI에 현재 판단된 처리 장치를 표시합니다.
+
+예:
+
+```text
+처리 장치: NVIDIA GeForce RTX 3060 · GPU 사용
+```
+
+또는:
+
+```text
+처리 장치: CPU · NVIDIA GPU 감지 안 됨
+```
+
+GPU 자동 사용 설정을 바꾸면 이미 메모리에 올려둔 STT/화자 모델은
+처리 장치가 달라질 수 있으므로 다시 불러오도록 초기화합니다.
+
+> `nvidia-smi`로 GPU가 보인다는 것은 NVIDIA GPU와 드라이버가 감지된다는 의미입니다.
+> 실제 faster-whisper GPU 실행에는 CTranslate2가 요구하는 CUDA/cuDNN 런타임도 정상이어야 합니다.
