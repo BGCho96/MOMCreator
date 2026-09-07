@@ -349,7 +349,11 @@ class TranscriptionTab(QWidget):
         self.model_loader: ModelLoadWorker | None = None
         self.stt_engine: LocalSTTEngine | None = None
         self.diarizer: LocalSpeakerDiarizer | None = None
-        self.processing_device: ProcessingDevice = resolve_processing_device(True)
+        self.stt_processing_device: ProcessingDevice = resolve_processing_device(True)
+        self.diar_processing_device: ProcessingDevice = resolve_processing_device(True)
+        # True only while an STT job that was started in continuous mode is
+        # waiting to hand off its completed transcript to diarization.
+        self._auto_diarize_pending = False
 
         root = QVBoxLayout(self)
 
@@ -397,34 +401,33 @@ class TranscriptionTab(QWidget):
         self.quality_combo.currentTextChanged.connect(self.on_stt_quality_changed)
         stt_row.addWidget(self.quality_combo)
 
+        self.stt_gpu_auto_check = QCheckBox("STT GPU 자동")
+        self.stt_gpu_auto_check.setChecked(True)
+        self.stt_gpu_auto_check.toggled.connect(self.on_stt_processing_device_changed)
+        self.stt_device_status = QLabel("")
+        self.stt_device_status.setStyleSheet("color: #555;")
+        stt_row.addWidget(self.stt_gpu_auto_check)
+        stt_row.addWidget(self.stt_device_status)
+
         self.stt_model_status = QLabel("STT 모델: 준비 안 됨")
         self.stt_load_button = QPushButton("STT 모델 불러오기")
         self.stt_load_button.clicked.connect(self.preload_stt_model)
+        self.chain_mode_check = QCheckBox("연속 실행 (STT → 화자 라벨링)")
+        self.chain_mode_check.setChecked(False)
+        self.chain_mode_check.setToolTip(
+            "체크하면 음성 파일 하나로 STT 완료 후 화자 라벨링을 자동으로 이어서 실행합니다."
+        )
+        self.chain_mode_check.toggled.connect(self.on_chain_mode_changed)
+
         self.stt_button = QPushButton("STT 실행")
         self.stt_button.clicked.connect(self.start_stt)
         self.stt_button.setEnabled(False)
         stt_row.addWidget(self.stt_model_status)
         stt_row.addWidget(self.stt_load_button)
+        stt_row.addWidget(self.chain_mode_check)
         stt_row.addWidget(self.stt_button)
         stt_row.addStretch(1)
         root.addLayout(stt_row)
-
-        performance_title = QLabel("성능 설정")
-        performance_title.setStyleSheet("font-weight: 600; margin-top: 10px;")
-        root.addWidget(performance_title)
-
-        performance_row = QHBoxLayout()
-        self.gpu_auto_check = QCheckBox("GPU 사용 가능하면 자동으로 사용")
-        self.gpu_auto_check.setChecked(True)
-        self.gpu_auto_check.toggled.connect(self.on_processing_device_changed)
-        self.device_status = QLabel("")
-        self.device_status.setStyleSheet("color: #555;")
-        performance_row.addWidget(self.gpu_auto_check)
-        performance_row.addSpacing(16)
-        performance_row.addWidget(self.device_status)
-        performance_row.addStretch(1)
-        root.addLayout(performance_row)
-        self.refresh_processing_device()
 
         diar_title = QLabel("화자 라벨링 · STT와 독립 실행")
         diar_title.setStyleSheet("font-weight: 600; margin-top: 10px;")
@@ -446,11 +449,20 @@ class TranscriptionTab(QWidget):
 
         diar_row.addWidget(QLabel("HF Token"))
         diar_row.addWidget(self.token_edit, 1)
+        self.diar_gpu_auto_check = QCheckBox("화자 GPU 자동")
+        self.diar_gpu_auto_check.setChecked(True)
+        self.diar_gpu_auto_check.toggled.connect(self.on_diar_processing_device_changed)
+        self.diar_device_status = QLabel("")
+        self.diar_device_status.setStyleSheet("color: #555;")
+        diar_row.addWidget(self.diar_gpu_auto_check)
+        diar_row.addWidget(self.diar_device_status)
         diar_row.addWidget(self.diar_model_status)
         diar_row.addWidget(self.diar_load_button)
         diar_row.addWidget(self.diarize_button)
         diar_row.addWidget(self.cancel_button)
         root.addLayout(diar_row)
+        self.refresh_stt_processing_device()
+        self.refresh_diar_processing_device()
 
         self.diar_hint = QLabel(
             "화자 라벨링 조건: ① 음성 파일 존재 ② 텍스트 존재 ③ 각 발언에 타임라인 존재 "
@@ -462,7 +474,9 @@ class TranscriptionTab(QWidget):
 
         privacy = QLabel(
             "STT와 화자 라벨링은 서로 독립적으로 실행됩니다. STT가 성공한 뒤 화자 모델에서 오류가 나더라도 "
-            "추출된 텍스트는 유지됩니다. 기존 타임라인 TXT + 원본 음성 조합으로도 화자 라벨링할 수 있습니다."
+            "추출된 텍스트는 유지됩니다. 기존 타임라인 TXT + 원본 음성 조합으로도 화자 라벨링할 수 있습니다. "
+            "STT와 화자 모델의 GPU 사용 여부도 각각 독립적으로 선택할 수 있습니다. "
+            "연속 실행을 체크하면 STT 성공 후 같은 음성에 화자 라벨링을 자동으로 이어서 실행합니다."
         )
         privacy.setWordWrap(True)
         privacy.setStyleSheet("color: #666;")
@@ -596,31 +610,48 @@ class TranscriptionTab(QWidget):
         }
         self.mode_label.setText(f"{audio_text} · {source_names.get(self.transcript_source, '')}")
 
-    def refresh_processing_device(self):
-        self.processing_device = resolve_processing_device(self.gpu_auto_check.isChecked())
-        if self.processing_device.device == "cuda":
-            self.device_status.setText(
-                f"처리 장치: {self.processing_device.display_name} · GPU 사용"
-            )
-        elif self.processing_device.gpu_available:
-            self.device_status.setText("처리 장치: CPU · GPU 자동 사용 꺼짐")
+    def refresh_stt_processing_device(self):
+        self.stt_processing_device = resolve_processing_device(
+            self.stt_gpu_auto_check.isChecked()
+        )
+        if self.stt_processing_device.device == "cuda":
+            self.stt_device_status.setText("GPU 사용")
+        elif self.stt_processing_device.gpu_available:
+            self.stt_device_status.setText("CPU · GPU 자동 꺼짐")
         else:
-            self.device_status.setText("처리 장치: CPU · NVIDIA GPU 감지 안 됨")
+            self.stt_device_status.setText("CPU · NVIDIA GPU 없음")
 
-    def on_processing_device_changed(self):
-        previous_device = (
-            self.processing_device.device,
-            self.processing_device.compute_type,
+    def refresh_diar_processing_device(self):
+        self.diar_processing_device = resolve_processing_device(
+            self.diar_gpu_auto_check.isChecked()
         )
-        self.refresh_processing_device()
-        current_device = (
-            self.processing_device.device,
-            self.processing_device.compute_type,
+        if self.diar_processing_device.device == "cuda":
+            self.diar_device_status.setText("GPU 사용")
+        elif self.diar_processing_device.gpu_available:
+            self.diar_device_status.setText("CPU · GPU 자동 꺼짐")
+        else:
+            self.diar_device_status.setText("CPU · NVIDIA GPU 없음")
+
+    def on_stt_processing_device_changed(self):
+        previous = (
+            self.stt_processing_device.device,
+            self.stt_processing_device.compute_type,
         )
-        if previous_device != current_device:
+        self.refresh_stt_processing_device()
+        current = (
+            self.stt_processing_device.device,
+            self.stt_processing_device.compute_type,
+        )
+        if previous != current:
             self.stt_engine = None
-            self.diarizer = None
             self.stt_model_status.setText("STT 모델: 준비 안 됨")
+
+    def on_diar_processing_device_changed(self):
+        previous = self.diar_processing_device.device
+        self.refresh_diar_processing_device()
+        current = self.diar_processing_device.device
+        if previous != current:
+            self.diarizer = None
             self.diar_model_status.setText("화자 모델: 준비 안 됨")
 
     def selected_model_size(self) -> str:
@@ -634,6 +665,15 @@ class TranscriptionTab(QWidget):
         if self.stt_engine is not None and self.stt_engine.model_size != selected:
             self.stt_engine = None
             self.stt_model_status.setText("STT 모델: 준비 안 됨")
+
+    def on_chain_mode_changed(self, checked: bool):
+        self.stt_button.setText(
+            "STT → 화자 라벨링 실행" if checked else "STT 실행"
+        )
+        if checked:
+            self.status_label.setText(
+                "연속 실행 모드: STT가 성공하면 화자 라벨링을 자동으로 이어서 실행합니다."
+            )
 
     def _model_loader_busy(self) -> bool:
         return self.model_loader is not None and self.model_loader.isRunning()
@@ -655,7 +695,9 @@ class TranscriptionTab(QWidget):
         self.language_combo.setEnabled(available)
         self.quality_combo.setEnabled(available)
         self.stt_load_button.setEnabled(available)
-        self.gpu_auto_check.setEnabled(available)
+        self.stt_gpu_auto_check.setEnabled(available)
+        self.chain_mode_check.setEnabled(available)
+        self.diar_gpu_auto_check.setEnabled(available)
         self.token_edit.setEnabled(available)
         self.diar_load_button.setEnabled(available)
         self.diarize_button.setEnabled(
@@ -682,11 +724,11 @@ class TranscriptionTab(QWidget):
             self.stt_model_status.setText(f"STT 모델: 준비됨 ({model_size} · {actual_device})")
             return
 
-        self.refresh_processing_device()
+        self.refresh_stt_processing_device()
         engine = LocalSTTEngine(
             model_size=model_size,
-            device=self.processing_device.device,
-            compute_type=self.processing_device.compute_type,
+            device=self.stt_processing_device.device,
+            compute_type=self.stt_processing_device.compute_type,
             language=self.selected_language(),
         )
         self.stt_model_status.setText(f"STT 모델: 불러오는 중 ({model_size})...")
@@ -707,11 +749,11 @@ class TranscriptionTab(QWidget):
             self.diar_model_status.setText(f"화자 모델: 준비됨 ({actual_device})")
             return
 
-        self.refresh_processing_device()
+        self.refresh_diar_processing_device()
         engine = LocalSpeakerDiarizer(
             hf_token=self.token_edit.text().strip() or os.getenv("HF_TOKEN"),
             local_model_path=os.getenv("PYANNOTE_MODEL_PATH"),
-            device=self.processing_device.device,
+            device=self.diar_processing_device.device,
         )
         self.diar_model_status.setText("화자 모델: 불러오는 중...")
         self.model_loader = ModelLoadWorker("diarization", engine, self)
@@ -747,7 +789,8 @@ class TranscriptionTab(QWidget):
 
     def model_load_finished(self):
         self.model_loader = None
-        self.refresh_processing_device()
+        self.refresh_stt_processing_device()
+        self.refresh_diar_processing_device()
         self.update_action_controls()
 
     def _sync_table_text_to_segments(self):
@@ -761,14 +804,17 @@ class TranscriptionTab(QWidget):
             QMessageBox.warning(self, "음성 파일", "먼저 음성 파일을 선택하세요.")
             return
 
-        self.refresh_processing_device()
+        self.refresh_stt_processing_device()
+        # Snapshot the option at job start. The checkbox is disabled while the
+        # worker is active, so this remains stable for the whole STT run.
+        self._auto_diarize_pending = self.chain_mode_check.isChecked()
         self.worker_kind = "stt"
         self.worker = STTWorker(
             audio_path=self.audio_path,
             model_size=self.selected_model_size(),
             language=self.selected_language(),
-            device=self.processing_device.device,
-            compute_type=self.processing_device.compute_type,
+            device=self.stt_processing_device.device,
+            compute_type=self.stt_processing_device.compute_type,
             stt_engine=self.stt_engine,
             parent=self,
         )
@@ -801,14 +847,14 @@ class TranscriptionTab(QWidget):
             QMessageBox.warning(self, "타임라인 확인 필요", str(exc))
             return
 
-        self.refresh_processing_device()
+        self.refresh_diar_processing_device()
         self.worker_kind = "diarization"
         self.worker = DiarizationWorker(
             audio_path=self.audio_path,
             transcript=normalized,
             audio_duration=self.audio_duration,
             hf_token=self.token_edit.text(),
-            device=self.processing_device.device,
+            device=self.diar_processing_device.device,
             diarizer=self.diarizer,
             parent=self,
         )
@@ -864,9 +910,14 @@ class TranscriptionTab(QWidget):
         self.speaker_ids = []
         self.speaker_panel.set_speakers([])
         self.populate_table()
-        self.status_label.setText(
-            f"STT 완료 · 발언 {len(self.segments)}개. 텍스트는 유지되며 화자 라벨링을 별도로 실행할 수 있습니다."
-        )
+        if self._auto_diarize_pending:
+            self.status_label.setText(
+                f"STT 완료 · 발언 {len(self.segments)}개. 화자 라벨링을 이어서 시작합니다..."
+            )
+        else:
+            self.status_label.setText(
+                f"STT 완료 · 발언 {len(self.segments)}개. 텍스트는 유지되며 화자 라벨링을 별도로 실행할 수 있습니다."
+            )
         self.progress_bar.setValue(100)
         self.progress_bar.setFormat("STT 완료 · 100%")
         self.update_mode_label()
@@ -889,22 +940,34 @@ class TranscriptionTab(QWidget):
 
     def analysis_cancelled(self):
         self._sync_model_status_from_worker()
+        self._auto_diarize_pending = False
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("작업 중지됨")
         self.status_label.setText("작업이 중지되었습니다. 기존 텍스트는 유지됩니다.")
 
     def analysis_failed(self, message: str):
         self._sync_model_status_from_worker()
+        self._auto_diarize_pending = False
         stage = "STT" if self.worker_kind == "stt" else "화자 라벨링"
         self.progress_bar.setFormat(f"{stage} 실패")
         self.status_label.setText(f"{stage} 실패 · 기존 텍스트는 유지됩니다.")
         QMessageBox.critical(self, f"{stage} 오류", message)
 
     def worker_finished(self):
+        finished_kind = self.worker_kind
+        should_chain = finished_kind == "stt" and self._auto_diarize_pending
+
         self.worker = None
         self.worker_kind = ""
-        self.refresh_processing_device()
+        self.refresh_stt_processing_device()
+        self.refresh_diar_processing_device()
         self.update_action_controls()
+
+        if should_chain:
+            # Consume the hand-off flag before launching the second worker so
+            # a diarization error/cancel can never accidentally restart it.
+            self._auto_diarize_pending = False
+            self.start_diarization()
 
     def display_speaker_id(self, speaker_id: str) -> str:
         if not speaker_id:
@@ -1008,7 +1071,7 @@ class FutureMinutesTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Meeting Transcriber v0.6")
+        self.setWindowTitle("Meeting Transcriber v0.7.1")
         self.resize(1120, 740)
 
         tabs = QTabWidget()

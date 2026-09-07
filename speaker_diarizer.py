@@ -1,23 +1,41 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
-import os
+
 from stt_engine import AnalysisCancelled, TranscriptSegment
+
+
 
 _FFMPEG_DLL_HANDLE = None
 
 
 def prepare_ffmpeg():
+    """Expose the standalone FFmpeg shared DLLs only inside this Python process.
+
+    The default path can be overridden with MOMCREATOR_FFMPEG_BIN.
+    This avoids installing FFmpeg into the Conda environment or the Windows-wide PATH.
+    """
     global _FFMPEG_DLL_HANDLE
 
-    ffmpeg_bin = r"C:\Tools\ffmpeg\bin"
+    if os.name != "nt":
+        return
+
+    ffmpeg_bin = os.getenv("MOMCREATOR_FFMPEG_BIN", r"C:\Tools\ffmpeg\bin")
+    if not Path(ffmpeg_bin).is_dir():
+        return
 
     if _FFMPEG_DLL_HANDLE is None:
         _FFMPEG_DLL_HANDLE = os.add_dll_directory(ffmpeg_bin)
 
-    os.environ["PATH"] = ffmpeg_bin + os.pathsep + os.environ.get("PATH", "")
+    current_path = os.environ.get("PATH", "")
+    path_parts = current_path.split(os.pathsep) if current_path else []
+    if ffmpeg_bin not in path_parts:
+        os.environ["PATH"] = ffmpeg_bin + os.pathsep + current_path
+
+
 @dataclass
 class SpeakerTurn:
     start: float
