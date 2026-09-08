@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
-from PyQt6.QtCore import QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -354,6 +355,21 @@ class TranscriptionTab(QWidget):
         # True only while an STT job that was started in continuous mode is
         # waiting to hand off its completed transcript to diarization.
         self._auto_diarize_pending = False
+
+        # Wall-clock timing is tracked independently from audio progress.
+        # This lets the UI show real processing time for STT, diarization,
+        # and the entire chained workflow.
+        self._stage_started_at: float | None = None
+        self._workflow_started_at: float | None = None
+        self._chain_run_active = False
+        self._last_progress_stage = ""
+        self._last_progress_detail = ""
+        self._last_progress_percent = 0
+        self._stt_elapsed_last: float | None = None
+        self._diar_elapsed_last: float | None = None
+        self._timing_timer = QTimer(self)
+        self._timing_timer.setInterval(1000)
+        self._timing_timer.timeout.connect(self._refresh_elapsed_status)
 
         root = QVBoxLayout(self)
 
@@ -793,6 +809,65 @@ class TranscriptionTab(QWidget):
         self.refresh_diar_processing_device()
         self.update_action_controls()
 
+    def _elapsed_since(self, started_at: float | None) -> float:
+        if started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - started_at)
+
+    def _start_job_timing(self, kind: str, chained: bool = False):
+        now = time.monotonic()
+
+        if kind == "stt":
+            # STT always starts a new workflow. In chained mode the same
+            # workflow start time is kept through the diarization hand-off.
+            self._workflow_started_at = now
+            self._chain_run_active = chained
+            self._stt_elapsed_last = None
+            self._diar_elapsed_last = None
+        elif not self._chain_run_active:
+            # Standalone diarization is its own workflow.
+            self._workflow_started_at = now
+            self._stt_elapsed_last = None
+            self._diar_elapsed_last = None
+
+        self._stage_started_at = now
+        self._last_progress_stage = "STT" if kind == "stt" else "화자 라벨링"
+        self._last_progress_detail = ""
+        self._last_progress_percent = 0
+
+        if not self._timing_timer.isActive():
+            self._timing_timer.start()
+        self._refresh_elapsed_status()
+
+    def _stop_job_timing(self):
+        if self._timing_timer.isActive():
+            self._timing_timer.stop()
+
+    def _refresh_elapsed_status(self):
+        if self._stage_started_at is None or not self.worker_kind:
+            return
+
+        stage_elapsed = self._elapsed_since(self._stage_started_at)
+        workflow_elapsed = self._elapsed_since(self._workflow_started_at)
+        stage = self._last_progress_stage or (
+            "STT" if self.worker_kind == "stt" else "화자 라벨링"
+        )
+        detail = f" · {self._last_progress_detail}" if self._last_progress_detail else ""
+
+        if self._chain_run_active:
+            elapsed_text = f"전체 경과 {format_time(workflow_elapsed)}"
+            prefix = "연속 실행 · "
+        else:
+            elapsed_text = f"경과 {format_time(stage_elapsed)}"
+            prefix = ""
+
+        self.progress_bar.setFormat(
+            f"{stage} · %p% · {elapsed_text}"
+        )
+        self.status_label.setText(
+            f"{prefix}{stage} 진행 중{detail} · {elapsed_text}"
+        )
+
     def _sync_table_text_to_segments(self):
         for row, segment in enumerate(self.segments):
             text_item = self.table.item(row, 2)
@@ -820,6 +895,7 @@ class TranscriptionTab(QWidget):
         )
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("STT 준비 중")
+        self._start_job_timing("stt", chained=self._auto_diarize_pending)
         self.worker.status.connect(self.status_label.setText)
         self.worker.progress.connect(self.update_progress)
         self.worker.completed.connect(self.stt_completed)
@@ -860,6 +936,10 @@ class TranscriptionTab(QWidget):
         )
         self.progress_bar.setValue(0)
         self.progress_bar.setFormat("화자 라벨링 준비 중")
+        self._start_job_timing(
+            "diarization",
+            chained=self._chain_run_active,
+        )
         self.worker.status.connect(self.status_label.setText)
         self.worker.progress.connect(self.update_progress)
         self.worker.completed.connect(self.diarization_completed)
@@ -878,12 +958,11 @@ class TranscriptionTab(QWidget):
 
     def update_progress(self, stage: str, percent: int, detail: str):
         percent = max(0, min(100, percent))
+        self._last_progress_stage = stage
+        self._last_progress_detail = detail
+        self._last_progress_percent = percent
         self.progress_bar.setValue(percent)
-        self.progress_bar.setFormat(f"{stage} · %p%")
-        if detail:
-            self.status_label.setText(f"{stage} 진행 중 · {detail}")
-        else:
-            self.status_label.setText(f"{stage} 진행 중")
+        self._refresh_elapsed_status()
 
     def _sync_model_status_from_worker(self):
         if self.worker is None:
@@ -903,6 +982,8 @@ class TranscriptionTab(QWidget):
 
     def stt_completed(self, segments):
         self._sync_model_status_from_worker()
+        self._stt_elapsed_last = self._elapsed_since(self._stage_started_at)
+        workflow_elapsed = self._elapsed_since(self._workflow_started_at)
         self.segments = list(segments)
         self.transcript_source = "stt"
         self.transcript_source_path = self.audio_path
@@ -912,18 +993,31 @@ class TranscriptionTab(QWidget):
         self.populate_table()
         if self._auto_diarize_pending:
             self.status_label.setText(
-                f"STT 완료 · 발언 {len(self.segments)}개. 화자 라벨링을 이어서 시작합니다..."
+                f"STT 완료 · 발언 {len(self.segments)}개 · STT 소요 {format_time(self._stt_elapsed_last)} "
+                f"· 전체 경과 {format_time(workflow_elapsed)} · 화자 라벨링을 이어서 시작합니다..."
+            )
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat(
+                f"STT 완료 · 100% · STT 소요 {format_time(self._stt_elapsed_last)}"
             )
         else:
+            self._stop_job_timing()
             self.status_label.setText(
-                f"STT 완료 · 발언 {len(self.segments)}개. 텍스트는 유지되며 화자 라벨링을 별도로 실행할 수 있습니다."
+                f"STT 완료 · 발언 {len(self.segments)}개 · 총 소요 {format_time(workflow_elapsed)}. "
+                "텍스트는 유지되며 화자 라벨링을 별도로 실행할 수 있습니다."
             )
-        self.progress_bar.setValue(100)
-        self.progress_bar.setFormat("STT 완료 · 100%")
+            self.progress_bar.setValue(100)
+            self.progress_bar.setFormat(
+                f"STT 완료 · 100% · 총 소요 {format_time(workflow_elapsed)}"
+            )
         self.update_mode_label()
 
     def diarization_completed(self, segments):
         self._sync_model_status_from_worker()
+        self._diar_elapsed_last = self._elapsed_since(self._stage_started_at)
+        workflow_elapsed = self._elapsed_since(self._workflow_started_at)
+        was_chain = self._chain_run_active
+        self._stop_job_timing()
         self.segments = list(segments)
         self.speaker_ids = []
         for seg in self.segments:
@@ -931,26 +1025,57 @@ class TranscriptionTab(QWidget):
                 self.speaker_ids.append(seg.speaker_id)
         self.speaker_panel.set_speakers(self.speaker_ids)
         self.populate_table()
-        self.status_label.setText(
-            f"화자 라벨링 완료 · 발언 {len(self.segments)}개 · 감지 화자 {len(self.speaker_ids)}명"
-        )
+
+        if was_chain:
+            stt_elapsed = self._stt_elapsed_last or 0.0
+            self.status_label.setText(
+                f"연속 실행 완료 · 발언 {len(self.segments)}개 · 감지 화자 {len(self.speaker_ids)}명 "
+                f"· STT {format_time(stt_elapsed)} · 화자 {format_time(self._diar_elapsed_last)} "
+                f"· 총 소요 {format_time(workflow_elapsed)}"
+            )
+            self.progress_bar.setFormat(
+                f"연속 실행 완료 · 100% · 총 소요 {format_time(workflow_elapsed)}"
+            )
+        else:
+            self.status_label.setText(
+                f"화자 라벨링 완료 · 발언 {len(self.segments)}개 · 감지 화자 {len(self.speaker_ids)}명 "
+                f"· 총 소요 {format_time(workflow_elapsed)}"
+            )
+            self.progress_bar.setFormat(
+                f"화자 라벨링 완료 · 100% · 총 소요 {format_time(workflow_elapsed)}"
+            )
+
         self.progress_bar.setValue(100)
-        self.progress_bar.setFormat("화자 라벨링 완료 · 100%")
+        self._chain_run_active = False
         self.update_mode_label()
 
     def analysis_cancelled(self):
         self._sync_model_status_from_worker()
+        workflow_elapsed = self._elapsed_since(self._workflow_started_at)
+        self._stop_job_timing()
         self._auto_diarize_pending = False
+        self._chain_run_active = False
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("작업 중지됨")
-        self.status_label.setText("작업이 중지되었습니다. 기존 텍스트는 유지됩니다.")
+        self.progress_bar.setFormat(
+            f"작업 중지됨 · 경과 {format_time(workflow_elapsed)}"
+        )
+        self.status_label.setText(
+            f"작업이 중지되었습니다 · 경과 {format_time(workflow_elapsed)}. 기존 텍스트는 유지됩니다."
+        )
 
     def analysis_failed(self, message: str):
         self._sync_model_status_from_worker()
+        workflow_elapsed = self._elapsed_since(self._workflow_started_at)
+        self._stop_job_timing()
         self._auto_diarize_pending = False
+        self._chain_run_active = False
         stage = "STT" if self.worker_kind == "stt" else "화자 라벨링"
-        self.progress_bar.setFormat(f"{stage} 실패")
-        self.status_label.setText(f"{stage} 실패 · 기존 텍스트는 유지됩니다.")
+        self.progress_bar.setFormat(
+            f"{stage} 실패 · 경과 {format_time(workflow_elapsed)}"
+        )
+        self.status_label.setText(
+            f"{stage} 실패 · 경과 {format_time(workflow_elapsed)} · 기존 텍스트는 유지됩니다."
+        )
         QMessageBox.critical(self, f"{stage} 오류", message)
 
     def worker_finished(self):
@@ -1071,7 +1196,7 @@ class FutureMinutesTab(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Meeting Transcriber v0.7.1")
+        self.setWindowTitle("Meeting Transcriber v0.7.2")
         self.resize(1120, 740)
 
         tabs = QTabWidget()
